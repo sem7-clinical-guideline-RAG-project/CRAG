@@ -1,0 +1,6 @@
+chromadb
+transformers
+torch
+numpy
+matplotlib
+requests
