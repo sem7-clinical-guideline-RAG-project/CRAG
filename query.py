@@ -60,7 +60,7 @@ collection = client.get_collection(
 
 print(
     f"Connected to collection: 'research_abstracts' "
-    f"({collection.count()} documents)\n"
+    f"({collection.count()} Chunks)\n"
 )
 
 
@@ -157,6 +157,12 @@ def display_results(question, results):
 
     print("\n" + "=" * 60)
 
+def display_source_files(results):
+    return [
+        meta.get("source", "N/A")
+        for meta in results["metadatas"][0]
+    ]
+
 
 # ==========================================
 # STEP 3.5: Generate LLM Response (RAG)
@@ -244,3 +250,5 @@ if __name__ == "__main__":
         answer = generate_rag_response(question, results, GROQ_API_KEY)
         print(answer)
         print("=" * 60)
+        print("Sorce_Files:")
+        print(display_source_files(results))
