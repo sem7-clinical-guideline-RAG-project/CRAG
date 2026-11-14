@@ -172,16 +172,18 @@ def display_source_files(results):
 def generate_rag_response(question, results, api_key):
     """
     Generate an answer to the question using Groq LLM,
-    passing the retrieved documents as context.
+    using only the highest-ranked retrieved document as context.
     """
     if not api_key or api_key == "YOUR_GROQ_API_KEY_HERE":
         return "\n[!] Groq API key not set. Skipping LLM generation. Please set GROQ_API_KEY in the script."
         
     print("\nGenerating response with Groq (gpt-oss-20b)...")
     
-    # Combine retrieved documents into a single context string
+    # Retrieval remains top-k, but answer generation uses only top-1.
     docs = results["documents"][0]
-    context = "\n\n".join([f"Document {i+1}:\n{doc}" for i, doc in enumerate(docs)])
+    if not docs:
+        return "I cannot find the answer in the provided documents."
+    context = f"Top retrieved document:\n{docs[0]}"
     
     # Build the prompt
     system_prompt = (
@@ -251,16 +253,16 @@ if __name__ == "__main__":
         answer = generate_rag_response(question, results, GROQ_API_KEY)
         print(answer)
 
-        # Evaluate the generated answer against the retrieved evidence.
+        # Evaluate the generated answer against the same top-1 evidence.
         print("\nSUFFICIENCY JUDGEMENT:")
         print("-" * 60)
-        knowledge_context = [
-            {"source": meta.get("source", "N/A"), "content": doc}
-            for meta, doc in zip(
-                results["metadatas"][0],
-                results["documents"][0],
-            )
-        ]
+        top_document = results["documents"][0][0] if results["documents"][0] else None
+        top_metadata = results["metadatas"][0][0] if results["metadatas"][0] else {}
+        knowledge_context = (
+            [{"source": top_metadata.get("source", "N/A"), "content": top_document}]
+            if top_document is not None
+            else []
+        )
         try:
             judgement = judge_sufficiency(
                 question,
@@ -273,5 +275,6 @@ if __name__ == "__main__":
             print(f"Judge unavailable: {error}")
 
         print("=" * 60)
+        
         print("Sorce_Files:")
         print(display_source_files(results))
