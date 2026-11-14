@@ -8,7 +8,7 @@ The sufficiency judge evaluates whether the RAG-generated answer sufficiently an
 
 - The user's question.
 - The RAG-generated answer.
-- Up to three retrieved passages, including passage text and source name. Retrieval similarity scores are not passed.
+- The top-1 retrieved passage, including passage text and source name. Retrieval similarity scores are not passed.
 - Up to eight reference examples for each label (`0` and `1`), excluding examples with the same question. These examples calibrate the labels; retrieved passages provide evidence for judging the current answer.
 
 ## Code locations
@@ -40,9 +40,9 @@ The answer-generation step separately uses `GROQ_API_KEY`; it is not a judge set
 
 ### 1. Retrieval and answer generation
 
-In the interactive flow, `query.py` calls `search(question, top_k=3)`. `search()` asks ChromaDB for up to three passages from the `research_abstracts` collection, in retrieval rank order. The same results are passed to `generate_rag_response()`, which gives the retrieved document text to Groq to generate the answer.
+In the interactive flow, `query.py` calls `search(question, top_k=3)`. `search()` asks ChromaDB for up to three passages from the `research_abstracts` collection, in retrieval rank order. All returned results are displayed, but only the first (top-1) passage is passed with the question to `generate_rag_response()` for answer generation.
 
-Afterward, `query.py` builds `knowledge_context` by pairing each returned document with its `source` metadata. It passes this evidence, along with the question and generated answer, to `judge_sufficiency()`. If retrieval returns fewer than three passages, only those available are passed. The judge receives the passage text and source names; retrieval distances/similarity scores are not passed.
+Afterward, `query.py` builds `knowledge_context` from that same top-1 passage and its `source` metadata. It passes this evidence, along with the question and generated answer, to `judge_sufficiency()`. If retrieval returns no passages, answer generation returns a not-found response and the judge receives an empty evidence list. The judge receives passage text and source name; retrieval distances/similarity scores are not passed.
 
 ### 2. Reference dataset
 
@@ -82,6 +82,16 @@ The function returns these as `gemini_label`, `gemini_judgement`, and `gemini_re
 ### 5. Display and errors
 
 `query.py` prints the judgement and reason after the answer. It catches errors from the judge and prints `Judge unavailable` with the error message. Errors include missing Gemini configuration, a missing Gemini SDK, empty or invalid JSON output, missing response fields, an invalid label, or disagreement between the label and judgement text. The judge validates the returned structure and label consistency; it does not independently verify the truth of Gemini's reason.
+
+## Judge input and evaluation steps
+
+After the RAG answer is generated, the judge processes it as follows:
+
+1. **Receive the answer and evidence.** `query.py` passes the user's question, Groq's generated answer, and the top-1 retrieved passage with its source name to `judge_sufficiency()`. Retrieval similarity scores are not passed. If no passage was retrieved, the judge receives an empty evidence list.
+2. **Load reference examples.** `judge_sufficiency()` loads `dataset_A.csv`, excludes examples whose question matches the current question (ignoring case and surrounding whitespace), then selects up to eight examples for each label. These examples calibrate the labels; they are not evidence for the current question.
+3. **Build the evaluation prompt.** `prompt_builder.py` combines the question, answer, top-1 evidence, and sampled examples. The instructions tell Gemini to assess whether the answer addresses the question with enough relevant information and is supported by the retrieved evidence. Gemini is instructed not to use outside knowledge, invent facts, or treat reference answers as evidence for the current question.
+4. **Return a judgement.** Gemini returns JSON with `sufficiency_label`, `judgement`, and `reason`. Label `1` means `SUFFICIENT`; label `0` means `INSUFFICIENT`.
+5. **Validate and display the result.** `llm_judge.py` checks that the response has the required fields and that the label agrees with the judgement text. `query.py` prints the judgement and reason. If configuration, the SDK, the API call, or response validation fails, it prints `Judge unavailable` and continues the interactive loop.
 
 ## Direct use
 
