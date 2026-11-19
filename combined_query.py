@@ -23,7 +23,11 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 from chatapp.clinical_rag import retrieval
-from classification.common.data_loader import LABEL_MAP, format_dataset_b_input
+from classification.common.data_loader import (
+    LABEL_MAP,
+    format_dataset_b_input,
+    format_multi_passage_input,
+)
 
 # ============================================================
 # CONFIGURATION
@@ -41,7 +45,7 @@ MODEL_C_CHECKPOINT = Path(__file__).parent / "classification" / "model_c_v2" / "
 MODEL_C_MAX_LENGTH = 512
 
 # Thresholds and weights (easily configurable here)
-DEFAULT_COMBINED_THRESHOLD = 0.75
+DEFAULT_COMBINED_THRESHOLD = 0.70
 MODEL_C_THRESHOLD = 0.50
 COSINE_THRESHOLD = 0.70
 
@@ -126,19 +130,30 @@ def display_retrieved_passages(question: str, results: dict):
 
 def classify_evidence_sufficiency(
     question: str,
-    passage_1: str,
-    passage_2: str,
-    passage_3: str,
+    passages: list,
+    passages_mode: int = 3,
 ) -> dict:
     """Classify evidence sufficiency using Model C."""
-    row = {
-        "question": question,
-        "passage_1": passage_1,
-        "passage_2": passage_2,
-        "passage_3": passage_3,
-    }
+    passage_1 = passages[0] if len(passages) > 0 else ""
+    passage_2 = passages[1] if len(passages) > 1 else ""
+    passage_3 = passages[2] if len(passages) > 2 else ""
 
-    formatted_text = format_dataset_b_input(row, max_length=MODEL_C_MAX_LENGTH)
+    if passages_mode == 1:
+        # Legacy single-passage format (passage_1 only via format_dataset_b_input)
+        row = {
+            "question": question,
+            "passage_1": passage_1,
+            "passage_2": passage_2,
+            "passage_3": passage_3,
+        }
+        formatted_text = format_dataset_b_input(row, max_length=MODEL_C_MAX_LENGTH)
+    else:
+        # 3-passage mode matching Model C V2 training data format
+        formatted_text = format_multi_passage_input(
+            question=question,
+            passages=passages,
+            max_length=MODEL_C_MAX_LENGTH,
+        )
 
     inputs = _model_c_tokenizer(
         formatted_text,
@@ -160,6 +175,7 @@ def classify_evidence_sufficiency(
             "insufficient": round(float(probs[0]), 4),
             "sufficient": round(float(probs[1]), 4),
         },
+        "formatted_text": formatted_text,
     }
 
 
@@ -208,12 +224,13 @@ def generate_groq_response(question: str, passages: list, api_key: str) -> str:
 # MAIN QUERY LOOP
 # ============================================================
 
-def run_query_loop(combined_threshold: float):
+def run_query_loop(combined_threshold: float, passages_mode: int = 3):
     """Interactive query loop using combined sufficiency scoring."""
     print("\n" + "=" * 70)
     print("DIABETES RAG — COMBINED SUFFICIENCY QUERY")
     print("=" * 70)
     print(f"  Combined threshold:  {combined_threshold:.2f}")
+    print(f"  Passages mode:       {passages_mode} passage(s)")
     print(f"  Model C weight:      {MODEL_C_WEIGHT}")
     print(f"  Cosine weight:       {COSINE_WEIGHT}")
     print(f"  Model C:             {MODEL_C_CHECKPOINT}")
@@ -256,11 +273,9 @@ def run_query_loop(combined_threshold: float):
         display_retrieved_passages(question, results)
 
         docs = results["documents"][0]
-        passage_1 = docs[0] if len(docs) > 0 else ""
-        passage_2 = docs[1] if len(docs) > 1 else ""
-        passage_3 = docs[2] if len(docs) > 2 else ""
+        distances = results["distances"][0]
 
-        if not passage_1:
+        if not docs or not docs[0]:
             print("\n" + "=" * 70)
             print("ABSTENTION: No passages retrieved.")
             print("-" * 70)
@@ -273,9 +288,8 @@ def run_query_loop(combined_threshold: float):
         try:
             classification = classify_evidence_sufficiency(
                 question=question,
-                passage_1=passage_1,
-                passage_2=passage_2,
-                passage_3=passage_3,
+                passages=docs,
+                passages_mode=passages_mode,
             )
             classification_scores = classification["scores"]
         except Exception as e:
@@ -288,32 +302,54 @@ def run_query_loop(combined_threshold: float):
             continue
 
         # Step 3: Calculate combined score and evaluate gate
-        raw_cosine_1 = similarity_scores.get("passage_1", 0.0)
-        clamped_cosine_1 = max(0.0, min(1.0, raw_cosine_1))
 
+        clamped_sims = [
+            max(0.0, min(1.0, 1.0 - float(dist)))
+            for dist in distances[:3]
+        ]
+
+        if passages_mode == 1:
+            # Preserve legacy single-passage behavior
+            active_cosine = clamped_sims[0] if clamped_sims else 0.0
+
+        else:
+            # Weighted cosine: P1 > P2 > P3
+            weights = [1.0, 0.5, 0.25][:len(clamped_sims)]
+
+            active_cosine = (
+                sum(score * weight for score, weight in zip(clamped_sims, weights))
+                / sum(weights)
+                if weights else 0.0
+            )
         classification_contribution = MODEL_C_WEIGHT * classification_scores["sufficient"]
-        cosine_contribution = COSINE_WEIGHT * clamped_cosine_1
+        cosine_contribution = COSINE_WEIGHT * active_cosine
 
         combined_score = round(classification_contribution + cosine_contribution, 4)
 
         model_c_label = int(classification_scores["sufficient"] >= MODEL_C_THRESHOLD)
         model_c_decision = LABEL_NAMES[model_c_label].upper()
 
-        cosine_label = int(raw_cosine_1 >= COSINE_THRESHOLD)
+        cosine_label = int(active_cosine >= COSINE_THRESHOLD)
         cosine_decision = "SUFFICIENT" if cosine_label == 1 else "INSUFFICIENT"
 
         print("\n" + "-" * 50)
         print("EVIDENCE SUFFICIENCY EVALUATION & COMBINED SCORE")
         print("-" * 50)
         print("A. Model C Classification:")
+        if passages_mode == 1:
+            print("  Model C input:            Passage 1 only (legacy format)")
+        else:
+            print(f"  Model C input:            Passages 1 to {len(docs)} (training format)")
         print(f"  Insufficient probability: {classification_scores['insufficient']:.4f}")
         print(f"  Sufficient probability:   {classification_scores['sufficient']:.4f}")
         print(f"  Model C Decision:         {model_c_decision}")
 
         print("\nB. Retrieval Cosine Similarity:")
-        print(f"  Passage 1 similarity:     {raw_cosine_1:.4f}")
-        print(f"  Passage 2 similarity:     {similarity_scores.get('passage_2', 0.0):.4f} (info only)")
-        print(f"  Passage 3 similarity:     {similarity_scores.get('passage_3', 0.0):.4f} (info only)")
+        for idx_hit, sim_val in enumerate(clamped_sims, start=1):
+            flag = "" if passages_mode == 3 else ("" if idx_hit == 1 else " (info only)")
+            print(f"  Passage {idx_hit} similarity:     {sim_val:.4f}{flag}")
+        if passages_mode == 3:
+            print(f"  Weighted Cosine Similarity: {active_cosine:.4f} (used in gate, n={len(clamped_sims)})")
         print(f"  Cosine Decision:          {cosine_decision}")
 
         print("\nC. Combined Decision:")
@@ -331,7 +367,7 @@ def run_query_loop(combined_threshold: float):
         if will_proceed:
             print(f"\n[3/3] Combined score ({combined_score:.4f}) >= threshold ({combined_threshold:.2f}). PASSED sufficiency check.")
             print("Generating answer with Groq...")
-            answer = generate_groq_response(question, [passage_1, passage_2, passage_3], GROQ_API_KEY)
+            answer = generate_groq_response(question, docs, GROQ_API_KEY)
             print("\n" + "=" * 70)
             print("LLM ANSWER (RAG):")
             print("-" * 70)
@@ -362,13 +398,20 @@ def main():
         default=DEFAULT_COMBINED_THRESHOLD,
         help=f"Combined threshold for sufficiency. Default: {DEFAULT_COMBINED_THRESHOLD}",
     )
+    parser.add_argument(
+        "--passages",
+        type=int,
+        choices=[1, 3],
+        default=3,
+        help="Number of retrieved passages to use in sufficiency gate: 1 (legacy passage 1 only) or 3 (all retrieved passages, default 3).",
+    )
     args = parser.parse_args()
 
     if not 0.0 <= args.combined_threshold <= 1.0:
         print(f"Error: Combined threshold must be between 0.0 and 1.0, got {args.combined_threshold}")
         sys.exit(1)
 
-    run_query_loop(combined_threshold=args.combined_threshold)
+    run_query_loop(combined_threshold=args.combined_threshold, passages_mode=args.passages)
 
 
 if __name__ == "__main__":

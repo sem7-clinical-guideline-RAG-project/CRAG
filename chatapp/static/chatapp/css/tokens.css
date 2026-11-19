@@ -17,6 +17,10 @@
   --color-focus: oklch(35% 0.13 162);
   --color-danger: oklch(55% 0.2 25);
   --color-danger-bg: oklch(94% 0.04 25);
+  --color-warning: oklch(70% 0.18 85);
+  --color-warning-bg: oklch(93% 0.05 85);
+  --color-success: oklch(45% 0.15 150);
+  --color-success-bg: oklch(90% 0.04 150);
   --color-backdrop: oklch(15% 0.02 170 / 0.5);
 
   /* Lifted from base.css brand */
@@ -164,6 +168,10 @@
   --color-focus: oklch(68% 0.15 160);
   --color-danger: oklch(62% 0.18 25);
   --color-danger-bg: oklch(20% 0.05 25);
+  --color-warning: oklch(80% 0.15 85);
+  --color-warning-bg: oklch(25% 0.05 85);
+  --color-success: oklch(65% 0.15 150);
+  --color-success-bg: oklch(20% 0.04 150);
   --color-backdrop: oklch(5% 0.005 170 / 0.8);
   --light: oklch(18% 0.015 170);
   --glint: oklch(30% 0.025 165);

@@ -70,3 +70,16 @@ LLM_JUDGE_TIMEOUT_SECONDS = 20  # Timeout for LLM judge API call
 LLM_JUDGE_PROVIDER = "groq"  # "gemini" or "groq"
 LLM_JUDGE_MODEL = "gemini-3.5-flash"  # Used when provider is "gemini"
 LLM_JUDGE_GROQ_MODEL = "openai/gpt-oss-20b"  # Used when provider is "groq"
+
+# ============================================================
+# Scope Detection Configuration
+# ============================================================
+# Scope model path (relative to PROJECT_ROOT)
+SCOPE_MODEL_PATH = PROJECT_ROOT / "classification" / "scope_detection" / "model" / "pubmedbert_best"
+
+# Scope detection max sequence length
+SCOPE_MAX_LENGTH = 64
+
+# Whether the scope detection gate is enabled
+# If disabled, all questions are treated as IN_SCOPE (for testing)
+SCOPE_DETECTION_ENABLED = True

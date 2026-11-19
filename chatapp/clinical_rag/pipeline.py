@@ -2,7 +2,7 @@
 
 import logging
 
-from . import config, generation, retrieval
+from . import config, generation, retrieval, scope
 from .sufficiency import (
     NoChecksConfiguredError,
     PartialSufficiencyResult,
@@ -110,6 +110,7 @@ def _build_sufficiency_details(
 def stream_rag_answer(question, history=None):
     """
     Generator of events:
+      {"type": "scope", "decision": "...", "label_id": int, "probabilities": {...}, "message": "..."}
       {"type": "query", "text": "..."}                         the question that was searched
       {"type": "sources", "sources": [...], "confidence": f}   the retrieved abstracts
       {"type": "sufficiency", "details": {...}}                evaluation results (emitted twice: partial then final)
@@ -117,6 +118,62 @@ def stream_rag_answer(question, history=None):
       {"type": "abstain", "reason": "...", "details": {...}}   evidence insufficient
       {"type": "error", "message": "..."}                      operational error
     """
+    # Step 1: Scope detection on the RAW user question (before condensation)
+    scope_response = scope.classify_scope(question)
+
+    # Emit scope decision event
+    pred = scope_response.scope_prediction
+    scope_event = {
+        "type": "scope",
+        "decision": scope_response.decision,
+        "label_id": pred.label_id if pred else None,
+        "probabilities": pred.probabilities if pred else {},
+        "message": scope_response.message,
+    }
+    yield scope_event
+
+    # Step 2: Route based on scope decision
+    if scope_response.decision == scope.ScopeDecision.OUT_OF_SCOPE:
+        # Out of scope: emit abstain with formal message and stop
+        if scope_response.message:
+            yield {
+                "type": "abstain",
+                "reason": scope_response.message,
+                "details": {
+                    "scope_decision": scope_response.decision,
+                    "scope_probabilities": pred.probabilities if pred else {},
+                },
+            }
+        return
+
+    if scope_response.decision == scope.ScopeDecision.NEEDS_CLARIFICATION:
+        # Needs clarification: emit abstain with formal message and stop
+        if scope_response.message:
+            yield {
+                "type": "abstain",
+                "reason": scope_response.message,
+                "details": {
+                    "scope_decision": scope_response.decision,
+                    "scope_probabilities": pred.probabilities if pred else {},
+                },
+            }
+        return
+
+    if scope_response.decision != scope.ScopeDecision.IN_SCOPE:
+        # Unexpected decision or error: fail-safe abstain
+        error_msg = scope_response.message or scope.SCOPE_DETECTION_ERROR_MESSAGE
+        yield {
+            "type": "abstain",
+            "reason": error_msg,
+            "details": {
+                "scope_decision": scope_response.decision,
+                "scope_probabilities": pred.probabilities if pred else {},
+                "scope_error": scope_response.error,
+            },
+        }
+        return
+
+    # Step 3: IN_SCOPE - continue with existing pipeline
     search_question = generation.condense_question(question, history or [])
     yield {"type": "query", "text": search_question}
 

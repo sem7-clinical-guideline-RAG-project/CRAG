@@ -4,8 +4,8 @@ import logging
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 from django.db import close_old_connections
-from django.http import FileResponse, Http404, JsonResponse, StreamingHttpResponse
-from django.shortcuts import get_object_or_404, redirect, render
+from django.http import Http404, JsonResponse, StreamingHttpResponse
+from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.text import slugify
 from django.views.decorators.http import require_POST
@@ -148,6 +148,7 @@ def ask_view(request):
         abstained = False
         errored = False
         abstain_details = None
+        abstain_reason_message = None
         try:
             for event in pipeline.stream_rag_answer(question, history=history):
                 kind = event["type"]
@@ -162,6 +163,8 @@ def ask_view(request):
                 elif kind == "abstain":
                     abstained = True
                     abstain_details = event.get("details", {})
+                    # Capture the formal reason message for scope-based abstentions
+                    abstain_reason_message = event.get("reason")
                 elif kind == "error":
                     errored = True
                 yield json.dumps(event) + "\n"
@@ -174,8 +177,8 @@ def ask_view(request):
             logger.debug("Caught SufficiencyError: %s", exc)
             yield json.dumps({"type": "error", "message": f"Sufficiency evaluation failed: {exc}"}) + "\n"
             return
-        except Exception as exc:
-            logger.exception("Chat answer failed with unexpected exception: %s", exc)
+        except Exception:
+            logger.exception("Chat answer failed with unexpected exception")
             yield json.dumps(
                 {"type": "error", "message": "Something went wrong while answering. Check the server terminal."}
             ) + "\n"
@@ -186,12 +189,24 @@ def ask_view(request):
             pass
         elif abstained:
             # Persist abstention as an assistant message with explanation
-            abstain_reason = (
-                "I cannot provide a reliable answer because the retrieved evidence "
-                "was insufficient to answer your question. The combined sufficiency "
-                f"score ({abstain_details.get('combined_score', 0):.4f}) is below "
-                f"the required threshold ({abstain_details.get('threshold', 0.70):.2f})."
-            )
+            # Check if this is a scope-based abstention
+            scope_decision = abstain_details.get("scope_decision")
+            scope_error = abstain_details.get("scope_error")
+
+            if scope_decision in ("OUT_OF_SCOPE", "NEEDS_CLARIFICATION"):
+                # Scope classification abstention: use the formal message from the event reason
+                abstain_reason = abstain_reason_message or "Scope detection failed."
+            elif scope_error is not None:
+                # Scope detection model failure (loading/inference error): persist formal error message
+                abstain_reason = abstain_reason_message or scope.SCOPE_DETECTION_ERROR_MESSAGE
+            else:
+                # Existing sufficiency-based abstention (insufficient evidence)
+                abstain_reason = (
+                    "I cannot provide a reliable answer because the retrieved evidence "
+                    "was insufficient to answer your question. The combined sufficiency "
+                    f"score ({abstain_details.get('combined_score', 0):.4f}) is below "
+                    f"the required threshold ({abstain_details.get('threshold', 0.70):.2f})."
+                )
             close_old_connections()
             ChatMessage.objects.create(
                 owner_id=user_id,

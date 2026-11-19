@@ -26,6 +26,10 @@ from chatapp.clinical_rag.sufficiency_checks import (
     ModelCOutputError,
     CosineSimilarityError,
     LLMJudgeError,
+    _build_judge_prompt,
+    _parse_judge_response,
+    _GeminiJudge,
+    _GroqJudge,
     get_model_c,
 )
 from chatapp.clinical_rag.sufficiency import (
@@ -192,30 +196,53 @@ class TestFallbackScore:
 
 
 # ============================================================
-# Tests for CosineCheck
+# Tests for CosineCheck (Rank-Weighted)
 # ============================================================
 
 class TestCosineCheck:
-    """Tests for cosine similarity check."""
+    """Tests for rank-weighted cosine similarity check."""
 
-    def test_uses_passage_1_similarity(self, sample_hits):
-        """Cosine check uses hits[0]['similarity'] (Passage 1)."""
+    def test_weighted_cosine_three_passages(self, sample_hits):
+        """Three passages use weights [1.0, 0.5, 0.25] with denominator 1.75."""
+        # sample_hits: P1=0.85, P2=0.70, P3=0.55
+        # weighted = (1.0*0.85 + 0.5*0.70 + 0.25*0.55) / 1.75 = 1.3375 / 1.75 = 0.7642857 -> 0.7643
         check = CosineCheck()
         result = check.evaluate("test question", sample_hits)
         assert result.name == "cosine"
-        assert result.score == 0.85  # hits[0].similarity
+        assert result.score == 0.7643
+        assert result.details["weights"] == [1.0, 0.5, 0.25]
+        assert result.details["weight_sum"] == 1.75
+        assert result.details["passages_used"] == 3
+        assert result.details["passage_similarities"] == [0.85, 0.70, 0.55]
 
-    def test_ignores_passage_2_and_3(self, sample_hits):
-        """Passage 2 and 3 do not affect cosine score."""
+    def test_weighted_cosine_two_passages(self):
+        """Two passages use weights [1.0, 0.5] with denominator 1.50."""
+        # P1=0.80, P2=0.60 -> (1.0*0.80 + 0.5*0.60) / 1.50 = 1.10 / 1.50 = 0.7333
         check = CosineCheck()
-        result = check.evaluate("test question", sample_hits)
-        # Even though passage 2 has 0.70 and passage 3 has 0.55,
-        # only passage 1 (0.85) is used
+        hits = [
+            {"similarity": 0.80, "content": "pass 1"},
+            {"similarity": 0.60, "content": "pass 2"},
+        ]
+        result = check.evaluate("test question", hits)
+        assert result.score == 0.7333
+        assert result.details["weights"] == [1.0, 0.5]
+        assert result.details["weight_sum"] == 1.5
+        assert result.details["passages_used"] == 2
+        assert result.details["passage_similarities"] == [0.80, 0.60]
+
+    def test_weighted_cosine_one_passage(self):
+        """One passage uses weight [1.0] with denominator 1.00."""
+        check = CosineCheck()
+        hits = [{"similarity": 0.85, "content": "pass 1"}]
+        result = check.evaluate("test question", hits)
         assert result.score == 0.85
-        assert result.details["passage_used"] == 1
+        assert result.details["weights"] == [1.0]
+        assert result.details["weight_sum"] == 1.0
+        assert result.details["passages_used"] == 1
+        assert result.details["passage_similarities"] == [0.85]
 
     def test_clamps_similarity_to_valid_range(self):
-        """Similarity is clamped to [0, 1]."""
+        """Similarities outside [0, 1] are clamped."""
         check = CosineCheck()
         hits_high = [{"similarity": 1.5, "content": "test"}]
         hits_low = [{"similarity": -0.5, "content": "test"}]
@@ -224,16 +251,46 @@ class TestCosineCheck:
         assert result_high.score == 1.0
         assert result_low.score == 0.0
 
+    def test_preserves_retrieval_rank_order(self):
+        """Rank 1 has highest weight (1.0) while Rank 3 has lowest weight (0.25)."""
+        check = CosineCheck()
+        hits_descending = [
+            {"similarity": 0.90, "content": "p1"},
+            {"similarity": 0.50, "content": "p2"},
+            {"similarity": 0.10, "content": "p3"},
+        ]
+        hits_ascending = [
+            {"similarity": 0.10, "content": "p1"},
+            {"similarity": 0.50, "content": "p2"},
+            {"similarity": 0.90, "content": "p3"},
+        ]
+        res_desc = check.evaluate("q", hits_descending)
+        res_asc = check.evaluate("q", hits_ascending)
+
+        # desc: (1.0*0.9 + 0.5*0.5 + 0.25*0.1) / 1.75 = (0.9 + 0.25 + 0.025) / 1.75 = 1.175 / 1.75 = 0.6714
+        # asc:  (1.0*0.1 + 0.5*0.5 + 0.25*0.9) / 1.75 = (0.1 + 0.25 + 0.225) / 1.75 = 0.575 / 1.75 = 0.3286
+        assert res_desc.score == 0.6714
+        assert res_asc.score == 0.3286
+        assert res_desc.score > res_asc.score
+
     def test_raises_on_empty_hits(self):
         """Empty hits raises CosineSimilarityError."""
         check = CosineCheck()
         with pytest.raises(CosineSimilarityError):
             check.evaluate("question", [])
 
-    def test_raises_on_missing_similarity(self):
-        """Missing similarity field raises CosineSimilarityError."""
+    def test_computes_similarity_from_distance_fallback(self):
+        """If 'similarity' key is missing, calculates 1 - distance."""
         check = CosineCheck()
-        hits = [{"content": "test"}]  # no 'similarity' key
+        hits = [{"distance": 0.25, "content": "test"}]
+        result = check.evaluate("q", hits)
+        assert result.score == 0.75
+        assert result.details["passage_similarities"] == [0.75]
+
+    def test_raises_on_missing_similarity_and_distance(self):
+        """Missing both similarity and distance raises CosineSimilarityError."""
+        check = CosineCheck()
+        hits = [{"content": "test"}]
         with pytest.raises(CosineSimilarityError):
             check.evaluate("question", hits)
 
@@ -250,35 +307,47 @@ class TestCosineCheck:
         result = check.evaluate("question", sample_hits)
         assert "similarity" in result.details
         assert "raw_similarity" in result.details
-        assert "passage_used" in result.details
-        assert result.details["passage_used"] == 1
+        assert "passage_similarities" in result.details
+        assert "weights" in result.details
+        assert "weight_sum" in result.details
+        assert "passages_used" in result.details
+        assert "formula" in result.details
+        assert result.details["passages_used"] == 3
 
 
 # ============================================================
-# Tests for ModelCCheck (with mocked model)
+# Tests for ModelCCheck (Multi-Passage with Mocked Model)
 # ============================================================
 
 class TestModelCCheck:
-    """Tests for Model C check."""
+    """Tests for multi-passage Model C check."""
 
-    def test_uses_passage_1_only(self, mock_model_c, sample_hits):
-        """Model C receives only Passage 1 content."""
+    def test_uses_all_three_passages(self, mock_model_c, sample_hits):
+        """Model C receives all 3 retrieved passages in original order."""
         check = ModelCCheck()
         result = check.evaluate("test question", sample_hits)
-        # Verify predict_proba was called with question and passage_1
         mock_model_c.predict_proba.assert_called_once()
         call_args = mock_model_c.predict_proba.call_args
-        assert call_args[0][0] == "test question"  # question
-        assert call_args[0][1] == sample_hits[0]["content"]  # passage_1
+        assert call_args[0][0] == "test question"
+        expected_passages = [h["content"] for h in sample_hits]
+        assert call_args[0][1] == expected_passages
+        assert result.details["passages_used"] == 3
 
-    def test_passage_2_and_3_ignored(self, mock_model_c, sample_hits):
-        """Passage 2 and 3 do not affect Model C input."""
+    def test_two_retrieved_passages(self, mock_model_c, sample_hits):
+        """Model C handles two retrieved passages correctly."""
         check = ModelCCheck()
-        result = check.evaluate("test question", sample_hits)
-        # The formatter inside predict_proba only uses passage_1
-        # This is verified by the mock call above
+        result = check.evaluate("test question", sample_hits[:2])
         call_args = mock_model_c.predict_proba.call_args
-        assert call_args[0][1] == sample_hits[0]["content"]
+        assert call_args[0][1] == [sample_hits[0]["content"], sample_hits[1]["content"]]
+        assert result.details["passages_used"] == 2
+
+    def test_one_retrieved_passage(self, mock_model_c, sample_hits):
+        """Model C handles single retrieved passage correctly."""
+        check = ModelCCheck()
+        result = check.evaluate("test question", sample_hits[:1])
+        call_args = mock_model_c.predict_proba.call_args
+        assert call_args[0][1] == [sample_hits[0]["content"]]
+        assert result.details["passages_used"] == 1
 
     def test_returns_probability_of_label_1(self, mock_model_c, sample_hits):
         """Score is P(sufficient) = probability of label 1."""
@@ -295,11 +364,11 @@ class TestModelCCheck:
         with pytest.raises(ModelCInferenceError):
             check.evaluate("question", [])
 
-    def test_raises_on_empty_passage_1(self, mock_model_c):
-        """Empty passage 1 content raises ModelCInferenceError."""
+    def test_raises_on_all_empty_passages(self, mock_model_c):
+        """All empty passage contents raises ModelCInferenceError."""
         check = ModelCCheck()
-        hits = [{"content": "", "similarity": 0.8}]
-        with pytest.raises(ModelCInferenceError):
+        hits = [{"content": ""}, {"content": "   "}]
+        with pytest.raises(ModelCInferenceError, match="All retrieved passages are empty"):
             check.evaluate("question", hits)
 
     def test_raises_on_missing_checkpoint(self):
@@ -322,9 +391,9 @@ class TestModelCCheck:
         result = check.evaluate("question", sample_hits)
         assert "probability_sufficient" in result.details
         assert "probability_insufficient" in result.details
-        assert "passage_used" in result.details
+        assert "passages_used" in result.details
         assert "max_length" in result.details
-        assert result.details["passage_used"] == 1
+        assert result.details["passages_used"] == 3
         assert result.details["max_length"] == 512
 
 
@@ -337,9 +406,9 @@ class TestSufficiencyEngine:
 
     def test_sufficient_when_score_above_threshold(self, mock_model_c, sample_hits):
         """Score >= 0.70 returns sufficient=True (with LLM judge disabled -> fallback)."""
-        # With LLM judge disabled: fallback uses renormalized weights
-        # model_c=0.92, cosine=0.85
-        # fallback = (0.10/0.55)*0.92 + (0.45/0.55)*0.85 = 0.1673 + 0.6955 = 0.8627
+        # Set all similarities to 0.85 -> weighted cosine = 0.85
+        for h in sample_hits:
+            h["similarity"] = 0.85
         mock_model_c.predict_proba.return_value = 0.92
         engine = SufficiencyEngine()
         partial = engine.evaluate_partial("test question", sample_hits)
@@ -351,10 +420,9 @@ class TestSufficiencyEngine:
 
     def test_insufficient_when_score_below_threshold(self, mock_model_c, sample_hits):
         """Score < 0.70 returns sufficient=False (with LLM judge disabled -> fallback)."""
-        # model_c=0.30, cosine=0.50
-        # fallback = (0.10/0.55)*0.30 + (0.45/0.55)*0.50 = 0.0545 + 0.4091 = 0.4636
+        for h in sample_hits:
+            h["similarity"] = 0.50
         mock_model_c.predict_proba.return_value = 0.30
-        sample_hits[0]["similarity"] = 0.50
         engine = SufficiencyEngine()
         partial = engine.evaluate_partial("test question", sample_hits)
         result = engine.finalize(partial)
@@ -364,10 +432,10 @@ class TestSufficiencyEngine:
 
     def test_exact_threshold_is_sufficient(self, mock_model_c, sample_hits):
         """Score exactly at threshold (0.70) returns sufficient=True (fallback)."""
-        # Need fallback = 0.70: (0.10/0.55)*mc + (0.45/0.55)*cos = 0.70
-        # If mc=1.0: (0.10/0.55) + (0.45/0.55)*cos = 0.70 -> cos = (0.70 - 0.1818)/0.8182 = 0.6333
+        # If mc=1.0: (0.10/0.55)*1.0 + (0.45/0.55)*cos = 0.70 -> cos = 0.6333333333333333
         mock_model_c.predict_proba.return_value = 1.0
-        sample_hits[0]["similarity"] = 0.6333333333333333
+        for h in sample_hits:
+            h["similarity"] = 0.6333333333333333
         engine = SufficiencyEngine()
         partial = engine.evaluate_partial("test question", sample_hits)
         result = engine.finalize(partial)
@@ -377,7 +445,8 @@ class TestSufficiencyEngine:
     def test_combined_score_matches_canonical_formula(self, mock_model_c, sample_hits):
         """Engine uses calculate_fallback_score when LLM judge disabled (single source of truth)."""
         mock_model_c.predict_proba.return_value = 0.88
-        sample_hits[0]["similarity"] = 0.78
+        for h in sample_hits:
+            h["similarity"] = 0.78
         engine = SufficiencyEngine()
         partial = engine.evaluate_partial("test question", sample_hits)
         result = engine.finalize(partial)
@@ -442,8 +511,11 @@ class TestSufficiencyEngine:
 
     def test_cosine_failure_propagates(self, mock_model_c, sample_hits):
         """Cosine failure raises error (fail-closed)."""
-        sample_hits[0]["similarity"] = None  # Will cause CosineSimilarityError
+        sample_hits[0]["similarity"] = None
+        sample_hits[0].pop("distance", None)
         engine = SufficiencyEngine()
+        with pytest.raises(CosineSimilarityError):
+            engine.evaluate_partial("test question", sample_hits)
         with pytest.raises(CosineSimilarityError):
             engine.evaluate_partial("test question", sample_hits)
 
@@ -495,7 +567,8 @@ class TestSufficiencyEngineWithLLMJudge:
     def test_llm_judge_score_included_when_done(self, engine_with_mocked_judge, mock_model_c, sample_hits):
         """LLM judge score included in combined score when successful."""
         mock_model_c.predict_proba.return_value = 0.90
-        sample_hits[0]["similarity"] = 0.80
+        for h in sample_hits:
+            h["similarity"] = 0.80
         engine = engine_with_mocked_judge
         partial = engine.evaluate_partial("test question", sample_hits)
         result = engine.finalize(partial)
@@ -510,7 +583,8 @@ class TestSufficiencyEngineWithLLMJudge:
         config.LLM_JUDGE_ENABLED = True
         try:
             mock_model_c.predict_proba.return_value = 0.90
-            sample_hits[0]["similarity"] = 0.80
+            for h in sample_hits:
+                h["similarity"] = 0.80
 
             engine = SufficiencyEngine()
             # Mock LLM judge to timeout
@@ -539,7 +613,8 @@ class TestSufficiencyEngineWithLLMJudge:
         config.LLM_JUDGE_ENABLED = True
         try:
             mock_model_c.predict_proba.return_value = 0.90
-            sample_hits[0]["similarity"] = 0.80
+            for h in sample_hits:
+                h["similarity"] = 0.80
 
             engine = SufficiencyEngine()
             mock_judge = MagicMock()
@@ -559,7 +634,8 @@ class TestSufficiencyEngineWithLLMJudge:
     def test_llm_judge_insufficient_score(self, engine_with_mocked_judge, mock_model_c, sample_hits):
         """LLM judge returning 0 (insufficient) lowers combined score."""
         mock_model_c.predict_proba.return_value = 0.90
-        sample_hits[0]["similarity"] = 0.80
+        for h in sample_hits:
+            h["similarity"] = 0.80
 
         engine = engine_with_mocked_judge
         engine._llm_judge_check.evaluate.return_value = CheckResult(
@@ -575,6 +651,256 @@ class TestSufficiencyEngineWithLLMJudge:
         # combined = 0.10*0.90 + 0.45*0.80 + 0.45*0.0 = 0.09 + 0.36 + 0 = 0.45
         assert result.combined_score == 0.45
         assert result.sufficient is False
+
+
+# ============================================================
+# Tests for LLM Judge Multi-Passage Evaluation
+# ============================================================
+
+class TestLLMJudgeCheckMultiPassage:
+    """Comprehensive unit tests for multi-passage LLM Judge evaluation."""
+
+    def test_prompt_building_single_passage(self):
+        """Prompt formats a single passage correctly with principles and headers."""
+        prompt = _build_judge_prompt("What is DKA?", "Diabetic ketoacidosis is an acute complication.")
+        assert "--- Retrieved Passage 1 ---" in prompt
+        assert "Diabetic ketoacidosis is an acute complication." in prompt
+        assert "SPECIFIC INFORMATION OVER GENERAL TOPIC" in prompt
+        assert "COLLECTIVE & COMPLEMENTARY EVIDENCE" in prompt
+        assert "IRRELEVANT PASSAGES" in prompt
+        assert "CONTRADICTIONS" in prompt
+
+    def test_prompt_building_multi_passages_ordering(self):
+        """Prompt preserves exact retrieval order of up to 3 passages."""
+        passages = [
+            "First hit: diagnostic criteria for diabetes.",
+            "Second hit: pediatric insulin dosages.",
+            "Third hit: hypoglycemia management.",
+        ]
+        prompt = _build_judge_prompt("Pediatric diabetes protocol?", passages)
+        idx_1 = prompt.find("--- Retrieved Passage 1 ---\nFirst hit: diagnostic criteria for diabetes.")
+        idx_2 = prompt.find("--- Retrieved Passage 2 ---\nSecond hit: pediatric insulin dosages.")
+        idx_3 = prompt.find("--- Retrieved Passage 3 ---\nThird hit: hypoglycemia management.")
+
+        assert idx_1 != -1
+        assert idx_2 != -1
+        assert idx_3 != -1
+        assert idx_1 < idx_2 < idx_3
+
+    def test_prompt_building_filters_empty_passages(self):
+        """Prompt filters out empty strings and whitespace passages while indexing remaining ones."""
+        passages = ["Valid first passage.", "", "   ", "Valid second passage."]
+        prompt = _build_judge_prompt("Test question?", passages)
+        assert "--- Retrieved Passage 1 ---\nValid first passage." in prompt
+        assert "--- Retrieved Passage 2 ---\nValid second passage." in prompt
+        assert "--- Retrieved Passage 3 ---" not in prompt
+
+    def test_prompt_building_all_empty_raises(self):
+        """Passing only empty passages raises LLMJudgeError."""
+        with pytest.raises(LLMJudgeError, match="No non-empty passages provided"):
+            _build_judge_prompt("Question?", ["", "   "])
+
+    def test_json_parsing_valid(self):
+        """Valid JSON parses correctly into score and reason."""
+        json_text = '{"sufficiency_score": 0.85, "reason": "Passages 1 and 2 collectively provide the answer."}'
+        score, reason = _parse_judge_response(json_text)
+        assert score == 0.85
+        assert reason == "Passages 1 and 2 collectively provide the answer."
+
+    def test_json_parsing_markdown_code_fences(self):
+        """JSON enclosed in markdown code fences is cleanly parsed."""
+        wrapped = '```json\n{\n  "sufficiency_score": 0.95,\n  "reason": "Direct evidence present."\n}\n```'
+        score, reason = _parse_judge_response(wrapped)
+        assert score == 0.95
+        assert reason == "Direct evidence present."
+
+    def test_json_parsing_invalid_cases(self):
+        """Malformed or out-of-range JSON triggers LLMJudgeError."""
+        with pytest.raises(LLMJudgeError, match="empty response"):
+            _parse_judge_response("")
+        with pytest.raises(LLMJudgeError, match="not valid JSON"):
+            _parse_judge_response("Not JSON at all")
+        with pytest.raises(LLMJudgeError, match="not a JSON object"):
+            _parse_judge_response('["array"]')
+        with pytest.raises(LLMJudgeError, match="Missing 'sufficiency_score'"):
+            _parse_judge_response('{"reason": "no score"}')
+        with pytest.raises(LLMJudgeError, match="Invalid score type"):
+            _parse_judge_response('{"sufficiency_score": "high", "reason": "invalid type"}')
+        with pytest.raises(LLMJudgeError, match="Score must be in"):
+            _parse_judge_response('{"sufficiency_score": 1.5, "reason": "too high"}')
+        with pytest.raises(LLMJudgeError, match="Score must be in"):
+            _parse_judge_response('{"sufficiency_score": -0.1, "reason": "too low"}')
+
+    def test_one_passage_sufficient_evidence(self):
+        """Single retrieved passage containing full evidence yields high sufficiency score."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (1.0, "Passage 1 completely answers the question.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "A1C target for pediatric type 1 diabetes is < 7.5% per ADA guidelines.", "similarity": 0.75}
+        ]
+        result = check.evaluate("What is the pediatric A1C target?", hits)
+
+        assert result.score == 1.0
+        assert result.details["passages_used"] == 1
+        assert result.details["sufficiency_score"] == 1.0
+        mock_backend.evaluate.assert_called_once_with(
+            "What is the pediatric A1C target?",
+            ["A1C target for pediatric type 1 diabetes is < 7.5% per ADA guidelines."]
+        )
+
+    def test_two_complementary_passages(self):
+        """Two passages providing complementary parts of an answer are passed in order."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (0.95, "Passage 1 gives symptoms; Passage 2 gives lab thresholds.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "DKA symptoms in children include polyuria, polydipsia, and vomiting.", "similarity": 0.80},
+            {"content": "DKA diagnosis requires blood glucose > 200 mg/dL and venous pH < 7.3.", "similarity": 0.72},
+        ]
+        result = check.evaluate("What are the clinical symptoms and diagnostic criteria for DKA in children?", hits)
+
+        assert result.score == 0.95
+        assert result.details["passages_used"] == 2
+        mock_backend.evaluate.assert_called_once_with(
+            "What are the clinical symptoms and diagnostic criteria for DKA in children?",
+            [
+                "DKA symptoms in children include polyuria, polydipsia, and vomiting.",
+                "DKA diagnosis requires blood glucose > 200 mg/dL and venous pH < 7.3.",
+            ]
+        )
+
+    def test_three_complementary_passages(self):
+        """Three passages collectively answering a multifaceted question."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (1.0, "Passages 1, 2, and 3 together cover screening, diagnosis, and treatment.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "Celiac screening in T1D starts with tTG-IgA testing at diagnosis.", "similarity": 0.82},
+            {"content": "If tTG-IgA is elevated, confirmation requires intestinal biopsy or high-titer IgA panel.", "similarity": 0.74},
+            {"content": "Management of confirmed celiac disease in children consists of a strict gluten-free diet.", "similarity": 0.68},
+        ]
+        result = check.evaluate("How is celiac disease screened, confirmed, and managed in children with T1D?", hits)
+
+        assert result.score == 1.0
+        assert result.details["passages_used"] == 3
+        mock_backend.evaluate.assert_called_once_with(
+            "How is celiac disease screened, confirmed, and managed in children with T1D?",
+            [h["content"] for h in hits]
+        )
+
+    def test_three_passages_correct_topic_but_lacking_answer(self):
+        """Passages discussing the right topic (DKA/diabetes) without answering the exact question."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (0.15, "Passages discuss DKA prevalence but do not state the fluid replacement rate.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "Trends in DKA prevalence show 30% of new T1D diagnoses present in ketoacidosis.", "similarity": 0.73},
+            {"content": "DKA prevalence is higher in ethnic minority youth and families without insurance.", "similarity": 0.70},
+            {"content": "Temporal trends remained stable between 2002 and 2010 in the SEARCH study.", "similarity": 0.67},
+        ]
+        result = check.evaluate("What is the initial intravenous fluid infusion rate in ml/kg/h for pediatric DKA resuscitation?", hits)
+
+        assert result.score == 0.15
+        assert result.details["passages_used"] == 3
+        assert result.score < config.COMBINED_THRESHOLD
+
+    def test_relevant_passage_with_irrelevant_passages(self):
+        """One highly relevant passage accompanied by two irrelevant distractors retains high sufficiency."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (0.90, "Passage 1 answers the question completely; Passages 2 and 3 are irrelevant.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "Canagliflozin reduced HbA1c by 0.8% in adolescents with type 2 diabetes.", "similarity": 0.78},
+            {"content": "Parking garage fees at Royal Children's Hospital averaged 15 dollars.", "similarity": 0.45},
+            {"content": "Bavarian nurse educators wear blue scrubs instead of green.", "similarity": 0.40},
+        ]
+        result = check.evaluate("What was the glycemic effect of canagliflozin in adolescents with type 2 diabetes?", hits)
+
+        assert result.score == 0.90
+        assert result.details["passages_used"] == 3
+
+    def test_contradictory_evidence_across_passages(self):
+        """Conflicting clinical recommendations lower the sufficiency score."""
+        check = LLMJudgeCheck()
+        mock_backend = MagicMock()
+        mock_backend.model = "mock-model"
+        mock_backend.evaluate.return_value = (0.30, "Passages present conflicting A1C targets: Passage 1 says <7.0% while Passage 2 says <7.5%.")
+        check._backend = mock_backend
+
+        hits = [
+            {"content": "Guideline A recommends target A1C under 7.0% for all pediatric patients.", "similarity": 0.79},
+            {"content": "Guideline B recommends target A1C under 7.5% due to severe hypoglycemia risks.", "similarity": 0.77},
+        ]
+        result = check.evaluate("What is the agreed consensus target A1C for children with diabetes?", hits)
+
+        assert result.score == 0.30
+        assert "conflicting" in result.details["reason"].lower()
+
+    def test_empty_or_missing_passages_raises(self):
+        """Empty hits list or hits with empty content raises LLMJudgeError."""
+        check = LLMJudgeCheck()
+        with pytest.raises(LLMJudgeError, match="No passages retrieved"):
+            check.evaluate("Question?", [])
+
+        with pytest.raises(LLMJudgeError, match="All retrieved passages are empty"):
+            check.evaluate("Question?", [{"content": ""}, {"content": "   "}])
+
+    def test_groq_backend_receives_multi_passage_prompt(self):
+        """_GroqJudge formats all passages and passes them to the Groq client."""
+        judge = _GroqJudge()
+        mock_client = MagicMock()
+        mock_completion = MagicMock()
+        mock_completion.choices = [
+            MagicMock(message=MagicMock(content='{"sufficiency_score": 0.88, "reason": "All 3 passages evaluated."}'))
+        ]
+        mock_client.chat.completions.create.return_value = mock_completion
+        judge._client = mock_client
+
+        passages = ["Evidence chunk 1", "Evidence chunk 2", "Evidence chunk 3"]
+        score, reason = judge.evaluate("Clinical question?", passages)
+
+        assert score == 0.88
+        assert reason == "All 3 passages evaluated."
+        call_args = mock_client.chat.completions.create.call_args
+        messages = call_args[1]["messages"]
+        prompt_content = messages[0]["content"]
+        assert "--- Retrieved Passage 1 ---\nEvidence chunk 1" in prompt_content
+        assert "--- Retrieved Passage 2 ---\nEvidence chunk 2" in prompt_content
+        assert "--- Retrieved Passage 3 ---\nEvidence chunk 3" in prompt_content
+
+    def test_gemini_backend_receives_multi_passage_prompt(self):
+        """_GeminiJudge formats all passages and passes them to the Gemini client."""
+        judge = _GeminiJudge()
+        mock_client = MagicMock()
+        mock_response = MagicMock(text='{"sufficiency_score": 0.92, "reason": "Multi-passage evidence sufficient."}')
+        mock_client.models.generate_content.return_value = mock_response
+        judge._client = mock_client
+
+        passages = ["Gemini passage 1", "Gemini passage 2"]
+        score, reason = judge.evaluate("Gemini question?", passages)
+
+        assert score == 0.92
+        assert reason == "Multi-passage evidence sufficient."
+        call_args = mock_client.models.generate_content.call_args
+        prompt_content = call_args[1]["contents"]
+        assert "--- Retrieved Passage 1 ---\nGemini passage 1" in prompt_content
+        assert "--- Retrieved Passage 2 ---\nGemini passage 2" in prompt_content
 
 
 # ============================================================
